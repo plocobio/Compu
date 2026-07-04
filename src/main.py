@@ -81,7 +81,8 @@ def generar_temperaturas_no_uniforme(T_min, T_max, n_T, ventana_critica,
 
 
 def estimar_tiempo(N_values, T_values, n_pmc, ventana_critica=None,
-                    factor_pmc_critico=1, n_calibracion=2000, semilla=42):
+                    factor_pmc_critico=1, n_calibracion=2000, semilla=42,
+                    n_procesos=1):
     """
     Calibra el coste de un pMC en esta máquina para cada N (incluye la
     compilación JIT de Numba, que solo ocurre una vez) y extrapola el
@@ -122,9 +123,20 @@ def estimar_tiempo(N_values, T_values, n_pmc, ventana_critica=None,
     total = sum(t * n_pmc * n_pmc_total_equiv for t in tiempo_por_pmc.values())
     print(f"\nRejilla de temperaturas: {n_fuera} puntos fuera de la ventana "
           f"critica + {n_dentro} puntos dentro (factor pMC x{factor_pmc_critico}).")
-    print(f"Tiempo total estimado para el barrido completo "
-          f"({len(T_values)} temperaturas x {len(N_values)} tamanos): "
+    print(f"Tiempo total de CPU (suma de todas las simulaciones): "
           f"~{total/60:.1f} min (~{total/3600:.2f} h)")
+
+    if n_procesos and n_procesos > 1:
+        # Estimacion ideal (reparto perfecto) y cota inferior de Amdahl: el
+        # tiempo de pared no puede bajar del punto individual mas costoso
+        # (tipicamente el N mayor dentro de la ventana critica).
+        t_max_por_pmc = max(tiempo_por_pmc.values())
+        cota_inferior = t_max_por_pmc * n_pmc * factor_pmc_critico
+        paralelo_ideal = max(total / n_procesos, cota_inferior)
+        print(f"Tiempo de PARED estimado con {n_procesos} procesos: "
+              f"~{paralelo_ideal/60:.1f} min (~{paralelo_ideal/3600:.2f} h) "
+              f"[cota inferior por la simulacion mas larga: "
+              f"~{cota_inferior/60:.1f} min]")
     print("\n(Aviso: es solo una estimacion; el rendimiento real depende de "
           "la carga de la maquina y puede variar.)")
     return total
@@ -164,6 +176,12 @@ def main():
                               "(el enunciado no pide ninguno; ver README).")
     parser.add_argument("--semilla", type=int, default=42,
                          help="Semilla base para reproducibilidad.")
+    parser.add_argument("--n-procesos", type=int, default=os.cpu_count(),
+                         help="Numero de procesos para ejecutar las "
+                              "simulaciones (N, T) en paralelo (una por core). "
+                              "Por defecto usa todos los cores; usa 1 para "
+                              "ejecucion en serie. El resultado es identico "
+                              "sea cual sea el numero de procesos.")
     parser.add_argument("--salida", type=str, default="data/resultados.csv")
     parser.add_argument("--quick", action="store_true",
                          help="Modo de prueba rapido (N y n_pmc pequenos) "
@@ -206,7 +224,7 @@ def main():
     if args.estimar_tiempo:
         estimar_tiempo(N_values, T_values, n_pmc, ventana_critica=ventana_critica,
                         factor_pmc_critico=args.factor_pmc_critico,
-                        semilla=args.semilla)
+                        semilla=args.semilla, n_procesos=args.n_procesos)
         return
 
     os.makedirs(os.path.dirname(args.salida) or ".", exist_ok=True)
@@ -222,7 +240,8 @@ def main():
                                n_termalizacion=args.n_termalizacion,
                                semilla=args.semilla, etiqueta="grueso",
                                ventana_critica=ventana_critica,
-                               factor_pmc_critico=args.factor_pmc_critico)
+                               factor_pmc_critico=args.factor_pmc_critico,
+                               n_procesos=args.n_procesos)
     df.to_csv(args.salida, index=False)
     print(f"\nResultados del barrido principal guardados en {args.salida}")
 
@@ -236,7 +255,8 @@ def main():
                                         medida_cada=medida_cada,
                                         n_termalizacion=args.n_termalizacion,
                                         semilla=args.semilla + 10_000,
-                                        etiqueta="fino")
+                                        etiqueta="fino",
+                                        n_procesos=args.n_procesos)
         salida_fino = os.path.join(os.path.dirname(args.salida) or ".",
                                     "resultados_fino.csv")
         df_fino.to_csv(salida_fino, index=False)

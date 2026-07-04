@@ -19,6 +19,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from analysis.analisis import (  # noqa: E402
     graficar_resultados, estimar_Tc_por_maximo_calor, ajuste_exponente_beta,
+    graficar_ajuste_beta_cada_N, graficar_ajuste_beta_todos_N,
+    graficar_panel_resumen, graficar_residuos_onsager,
+    graficar_susceptibilidad, graficar_binder, graficar_colapso_magnetizacion,
+    graficar_snapshots, graficar_autocorrelacion,
 )
 from src.onsager import TC_ONSAGER, BETA_ONSAGER  # noqa: E402
 
@@ -29,6 +33,11 @@ def main():
     parser.add_argument("--datos-fino", type=str, default="data/resultados_fino.csv",
                          help="CSV del barrido fino alrededor de Tc (opcional).")
     parser.add_argument("--figuras", type=str, default="figures")
+    parser.add_argument("--sin-extras", action="store_true",
+                         help="Omite las figuras basadas en simulaciones propias "
+                              "(snapshots, autocorrelacion), que lanzan "
+                              "simulaciones cortas adicionales y tardan un "
+                              "poco mas.")
     args = parser.parse_args()
 
     df = pd.read_csv(args.datos)
@@ -40,6 +49,17 @@ def main():
 
     print("\nGenerando graficas en", args.figuras)
     graficar_resultados(df, out_dir=args.figuras)
+
+    # --- Figuras adicionales del Grupo A (solo requieren el CSV) ---
+    graficar_panel_resumen(df, out_dir=args.figuras)
+    graficar_residuos_onsager(df, out_dir=args.figuras)
+
+    # --- Figuras adicionales del Grupo B (susceptibilidad y Binder) ---
+    graficar_susceptibilidad(df, out_dir=args.figuras)
+    graficar_binder(df, out_dir=args.figuras)
+
+    # --- Colapso de escala (Grupo C, requiere >=2 tamaños N) ---
+    graficar_colapso_magnetizacion(df, out_dir=args.figuras)
 
     df_tc = df
     if args.datos_fino and os.path.exists(args.datos_fino):
@@ -60,7 +80,7 @@ def main():
     print(f"Diferencia relativa: "
           f"{abs(Tc_extrap - TC_ONSAGER) / TC_ONSAGER * 100:.2f} %")
 
-    resultado_beta = ajuste_exponente_beta(df, out_dir=args.figuras)
+    resultado_beta = ajuste_exponente_beta(df, out_dir=args.figuras, graficar=False)
     print("\n=== Estimacion del exponente critico beta (magnetizacion) ===")
     print(f"N usado como referencia: {resultado_beta['N']}")
     print(f"Puntos usados en el ajuste: {resultado_beta['puntos_usados']}")
@@ -68,6 +88,19 @@ def main():
     print(f"beta (Onsager, exacto): {BETA_ONSAGER:.4f}")
     if resultado_beta["aviso"]:
         print(f"\nAVISO: {resultado_beta['aviso']}")
+    graficar_ajuste_beta_cada_N(df, out_dir=args.figuras)
+    graficar_ajuste_beta_todos_N(df, out_dir=args.figuras)
+
+    # --- Figuras adicionales del Grupo C que lanzan simulaciones propias
+    #     (configuraciones, series temporales): snapshots y autocorrelacion
+    #     / ralentizacion critica. ---
+    if not args.sin_extras:
+        print("\nGenerando figuras extra (simulaciones cortas propias): "
+              "snapshots y autocorrelacion...")
+        graficar_snapshots(df=df, out_dir=args.figuras)
+        graficar_autocorrelacion(out_dir=args.figuras)
+    else:
+        print("\n(--sin-extras: se omiten snapshots y autocorrelacion.)")
 
     print(f"\nFiguras guardadas en: {os.path.abspath(args.figuras)}")
 

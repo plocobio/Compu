@@ -95,7 +95,9 @@ python -m src.main --estimar-tiempo
 python -m src.main
 ```
 
-Parámetros configurables (ver `python -m src.main --help`): `--N`, `--T-min`, `--T-max`, `--n-T`, `--n-pmc`, `--medida-cada`, `--semilla`, `--salida`.
+**Ejecución en paralelo:** las simulaciones de cada punto `(N, T)` son independientes y se reparten entre los cores de la CPU con `ProcessPoolExecutor`. Por defecto se usan **todos los cores** (`--n-procesos` = `os.cpu_count()`); así, por ejemplo, `N=16` y `N=32` (y todos los demás puntos) se simulan simultáneamente. Usa `--n-procesos 1` para forzar ejecución en serie. La granularidad es por punto `(N, T)` —no por tamaño `N`— para que ningún core quede parado: al terminar los `N` pequeños, ese core pasa a ayudar con los grandes. **La semilla de cada punto depende solo de su índice fijo en el orden `(N, T)`, no del orden en que terminan los procesos, así que el CSV resultante es idéntico bit a bit sea cual sea el número de procesos** (se puede comprobar comparando `--n-procesos 1` con `--n-procesos 8`). El tiempo de pared no puede bajar de la simulación individual más costosa (cota de Amdahl, típicamente un punto de `N=128` en la ventana crítica); `--estimar-tiempo` informa de esa cota.
+
+Parámetros configurables (ver `python -m src.main --help`): `--N`, `--T-min`, `--T-max`, `--n-T`, `--n-pmc`, `--medida-cada`, `--semilla`, `--n-procesos`, `--salida`.
 
 Opcionalmente, añade un segundo barrido más fino de temperaturas alrededor de \(T_c\) de Onsager (mejora la estimación de \(T_c(N)\), ya que con solo 10 temperaturas la rejilla es muy gruesa):
 
@@ -109,13 +111,43 @@ python -m src.main --sweep-fino
 python -m analysis.run_analisis
 ```
 
-Genera en `figures/`: `magnetizacion_vs_T.png`, `energia_por_spin_vs_T.png`, `energia_enunciado_vs_T.png`, `calor_especifico_vs_T.png`, `Tc_vs_1_N.png`, `ajuste_beta.png`; e imprime por pantalla la tabla de resultados, la estimación de \(T_c(N\to\infty)\) y la estimación numérica de \(\beta\), comparadas con Onsager.
+Genera en `figures/` las gráficas principales, la extrapolación de \(T_c\) y el colapso de escala; e imprime por pantalla la tabla de resultados, la estimación de \(T_c(N\to\infty)\) y la estimación numérica de \(\beta\), comparadas con Onsager.
+
+**Convención de nombres — cada tamaño vs. todos los tamaños combinados:** para casi todas las magnitudes se genera UNA figura POR CADA \(N\) presente en el CSV, más UNA figura combinada:
+- `<nombre>_N{N}.png`: un único tamaño \(N\) (una por cada valor de \(N\) en los datos: `..._N16.png`, `..._N32.png`, `..._N64.png`, `..._N128.png`, ...), útil cuando el solapamiento de curvas dificulta la lectura.
+- `<nombre>.png`: **todos** los tamaños \(N\) superpuestos en una sola figura.
+
+En todas, el color de cada \(N\) es el mismo (paleta cualitativa fija, según su posición entre todos los tamaños disponibles), para que se reconozca de un plot a otro:
+`#8dd3c7`, `#ffffb3`, `#bebada`, `#fb8072`, `#80b1d3`, `#fdb462`, `#b3de69`.
+
+| Figura (todos los tamaños) | Figura (por cada tamaño) | Qué muestra | Por qué es interesante |
+|---|---|---|---|
+| `magnetizacion_vs_T.png` | `magnetizacion_vs_T_N{N}.png` | \(m_N\) vs \(T\), + Onsager | Curva de orden de la transición |
+| `energia_por_spin_vs_T.png` | `energia_por_spin_vs_T_N{N}.png` | \(\langle E\rangle/N^2\) vs \(T\), + Onsager | Energía interna, intensiva y comparable con Onsager |
+| `energia_enunciado_vs_T.png` | `energia_enunciado_vs_T_N{N}.png` | \(e_N=\langle E\rangle/(2N)\) (ec. 15, literal) | Magnitud tal como la define el enunciado |
+| `calor_especifico_vs_T.png` | `calor_especifico_vs_T_N{N}.png` | \(c_N\) vs \(T\) | Localiza \(T_c(N)\) por su máximo |
+| `figura_resumen.png` | `figura_resumen_N{N}.png` | Panel triple (a,b,c): \(m_N\), \(\langle E\rangle/N^2\), \(c_N\) | Resume la fenomenología en un único lienzo de artículo |
+| `susceptibilidad_vs_T.png` | `susceptibilidad_vs_T_N{N}.png` | \(\chi_N(T)=(N^2/T)(\langle m^2\rangle-\langle|m|\rangle^2)\) | Su pico da una 2.ª estimación de \(T_c(N)\) y acceso a \(\gamma\) |
+| `binder_vs_T.png` | `binder_vs_T_N{N}.png` | Cumulante de Binder \(U_4(T)\) | Las curvas de distintos \(N\) **se cruzan** en \(T_c\) (localiza \(T_c\) sin extrapolar) |
+| `ajuste_beta.png` | `ajuste_beta_N{N}.png` | \(\log m_N\) vs \(\log(T_c-T)\), un ajuste de \(\beta\) por \(N\) | Compara cómo varía la estimación de \(\beta\) con el tamaño de red |
+| `snapshots_configuracion.png` | `snapshots_configuracion_N{N}.png` | Configuraciones de espines a \(T<T_c,\ \sim T_c,\ >T_c\) | Visualiza dominios, clústeres críticos y desorden (leyenda indica qué color es cada espín) |
+
+Además, sin esta duplicación (ya combinan intrínsecamente todos los \(N\), o no aplican):
+
+| Figura | Qué muestra | Por qué es interesante |
+|--------|-------------|------------------------|
+| `Tc_vs_1_N.png` | Extrapolación \(T_c(N)=T_c^\infty+a/N\) | Estimación de \(T_c\) en el límite termodinámico |
+| `residuos_magnetizacion_vs_T.png` | \(m_N - m_\text{Onsager}\) frente a \(T\) | Hace explícito el "redondeo" de tamaño finito alrededor de \(T_c\) |
+| `colapso_magnetizacion.png` | \(m_N N^{\beta/\nu}\) vs \((T-T_c)N^{1/\nu}\) | Colapso de escala: valida los exponentes \(\beta=1/8,\ \nu=1\) (requiere \(\ge 2\) tamaños \(N\)) |
+| `autocorrelacion_vs_lag.png`, `tiempo_autocorrelacion_vs_T.png` | \(\rho(k)\) y \(\tau_\text{int}(T)\) | Ralentización crítica: justifica el uso de blocking/bootstrap |
+
+Snapshots y autocorrelación lanzan simulaciones cortas propias; se pueden omitir con `python -m analysis.run_analisis --sin-extras`. La susceptibilidad y el cumulante de Binder requieren las columnas `chi`/`binder` del CSV, producidas por el barrido actualizado (vuelve a ejecutar `python -m src.main`); el colapso de escala y las comparaciones "todos los tamaños" necesitan simular varios tamaños (p.ej. `--N 16 32 64 128`).
 
 ## Notas de diseño
 
 - **Reproducibilidad:** semilla configurable (`--semilla`); Numba usa un generador aleatorio propio (independiente de NumPy), fijado explícitamente en cada simulación.
 - **Normalización de la energía:** el enunciado define \(e_N=\langle E\rangle/(2N)\) (ec. 15), pero esa normalización no es intensiva para una red \(N\times N\) (el número de enlaces es \(2N^2\), no \(2N\)). El código calcula **ambas** cantidades: `e_enunciado` (literal, ec. 15) y `e_por_spin` = \(\langle E\rangle/N^2\) (energía por espín, la magnitud intensiva estándar), para poder comparar.
-- **Errores:** las medidas Monte Carlo sucesivas están correlacionadas, así que no se usa la desviación estándar ingenua. `m_N` y `e_N` usan el método de *blocking* (Flyvbjerg–Petersen); `c_N`, al ser una función no lineal de la serie de energías, usa *bootstrap* por bloques.
+- **Errores:** las medidas Monte Carlo sucesivas están correlacionadas, así que no se usa la desviación estándar ingenua. `m_N` y `e_N` usan el método de *blocking* (Flyvbjerg–Petersen); `c_N`, `chi` (susceptibilidad) y `binder` (cumulante de Binder), al ser funciones no lineales de la serie temporal, usan *bootstrap* por bloques.
 - **Termalización:** por defecto no se descarta ninguna fase de equilibrado (`--n-termalizacion 0`), siguiendo la letra del enunciado (se parte de la configuración ordenada y se mide desde el principio). Ver la sección de limitaciones más abajo.
 
 ## Referencias

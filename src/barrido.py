@@ -1,10 +1,20 @@
 """
 Barrido de temperaturas y tamaños de red: orquesta `simular_ising` sobre
 la rejilla (N, T) pedida por el enunciado y calcula valores medios y
-errores de magnetización, energía y calor específico.
+errores de magnetización, energía, calor específico, susceptibilidad y
+cumulante de Binder.
+
+Cada punto (N, T) es una simulación independiente, así que el barrido se
+ejecuta EN PARALELO repartiendo los puntos entre los cores de la CPU con
+`ProcessPoolExecutor` (ver `n_procesos` en `barrido_temperaturas`). La
+semilla de cada punto se deriva de su índice fijo en el orden (N, T), de
+modo que el resultado es idéntico bit a bit al de la ejecución en serie,
+independientemente del número de procesos.
 """
 
+import os
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
@@ -18,10 +28,109 @@ def _calor_especifico(energias, N, T):
     return (np.mean(energias ** 2) - np.mean(energias) ** 2) / (N ** 2 * T)
 
 
+def _susceptibilidad(magnetizaciones, N, T):
+    """
+    Susceptibilidad magnética por espín, a partir de la serie de
+    magnetizaciones (por espín, con signo):
+
+        chi_N = (N^2 / T) [ <m^2> - <|m|>^2 ]
+
+    Se usa <|m|> (no <m>) porque en una red finita por debajo de Tc el
+    signo global fluctúa; la convención con valor absoluto es la habitual
+    para que chi no diverja artificialmente por el cambio de signo.
+    """
+    m_abs = np.abs(magnetizaciones)
+    return (N ** 2 / T) * (np.mean(m_abs ** 2) - np.mean(m_abs) ** 2)
+
+
+def _binder(magnetizaciones):
+    """
+    Cumulante de Binder de cuarto orden:
+
+        U_4 = 1 - <m^4> / (3 <m^2>^2)
+
+    Es adimensional y (en el límite de N grande) tiende a 0 para T>Tc y a
+    2/3 para T<Tc; las curvas U_4(T) de distintos N se cruzan en Tc, lo
+    que permite localizar el punto crítico sin extrapolar en 1/N.
+    """
+    m2 = np.mean(magnetizaciones ** 2)
+    m4 = np.mean(magnetizaciones ** 4)
+    return 1.0 - m4 / (3.0 * m2 ** 2)
+
+
+def _simular_punto(tarea):
+    """
+    Ejecuta UNA simulación (N, T) y devuelve la fila de resultados (valores
+    medios y errores de m, e, c, chi, binder).
+
+    Es el "worker" que se ejecuta en cada proceso al paralelizar el barrido.
+    Está a nivel de módulo y recibe una tupla de argumentos simples (todos
+    picklables) porque `ProcessPoolExecutor` en macOS arranca los procesos
+    con el método 'spawn', que reimporta el módulo y necesita que la función
+    y sus argumentos sean serializables e importables desde el top-level.
+
+    `tarea` = (N, T, n_pmc_T, medida_cada, n_termalizacion, semilla_run,
+               n_bootstrap, etiqueta)
+    """
+    (N, T, n_pmc_T, medida_cada, n_termalizacion, semilla_run,
+     n_bootstrap, etiqueta) = tarea
+
+    magnetizaciones, energias, _ = simular_ising(
+        N, T, n_pmc_T, medida_cada, n_termalizacion, semilla_run)
+
+    m_mean, m_err = estimar_errores(np.abs(magnetizaciones))
+
+    e_mean, e_err = estimar_errores(energias)
+    e_enunciado = e_mean / (2.0 * N)
+    e_enunciado_err = e_err / (2.0 * N)
+    e_por_spin = e_mean / (N ** 2)
+    e_por_spin_err = e_err / (N ** 2)
+
+    c_mean = _calor_especifico(energias, N, T)
+    c_err = bootstrap_bloques(
+        energias, lambda e: _calor_especifico(e, N, T),
+        n_bootstrap=n_bootstrap, semilla=semilla_run)
+
+    # Susceptibilidad y cumulante de Binder: ambos son funciones no lineales
+    # de la serie de magnetizaciones, así que su error se propaga con
+    # bootstrap por bloques (igual que c_N).
+    chi_mean = _susceptibilidad(magnetizaciones, N, T)
+    chi_err = bootstrap_bloques(
+        magnetizaciones, lambda mm: _susceptibilidad(mm, N, T),
+        n_bootstrap=n_bootstrap, semilla=semilla_run)
+    binder_mean = _binder(magnetizaciones)
+    binder_err = bootstrap_bloques(
+        magnetizaciones, _binder,
+        n_bootstrap=n_bootstrap, semilla=semilla_run)
+
+    return dict(
+        N=N, T=T, malla=etiqueta, n_pmc=n_pmc_T,
+        m=m_mean, m_err=m_err,
+        e_enunciado=e_enunciado, e_enunciado_err=e_enunciado_err,
+        e_por_spin=e_por_spin, e_por_spin_err=e_por_spin_err,
+        c=c_mean, c_err=c_err,
+        chi=chi_mean, chi_err=chi_err,
+        binder=binder_mean, binder_err=binder_err,
+    )
+
+
+def _log_progreso(k, total, fila, t_inicio):
+    """Imprime el progreso de un punto ya completado (k de total)."""
+    transcurrido = time.time() - t_inicio
+    restante = transcurrido / k * (total - k)
+    print(f"[{k:3d}/{total}] N={fila['N']:4d} T={fila['T']:.4f} "
+          f"n_pmc={fila['n_pmc']:8d}  "
+          f"m={fila['m']:.4f}+-{fila['m_err']:.4f}  "
+          f"e_spin={fila['e_por_spin']:.4f}+-{fila['e_por_spin_err']:.4f}  "
+          f"c={fila['c']:.4f}+-{fila['c_err']:.4f}  "
+          f"(transcurrido {transcurrido/60:.1f} min, "
+          f"restante ~{restante/60:.1f} min)")
+
+
 def barrido_temperaturas(N_values, T_values, n_pmc=1_000_000, medida_cada=100,
                           n_termalizacion=0, semilla=42, n_bootstrap=200,
                           etiqueta="grueso", ventana_critica=None,
-                          factor_pmc_critico=1, verbose=True):
+                          factor_pmc_critico=1, verbose=True, n_procesos=None):
     """
     Recorre todas las combinaciones (N, T), simula el modelo de Ising y
     calcula valores medios y errores de:
@@ -66,61 +175,70 @@ def barrido_temperaturas(N_values, T_values, n_pmc=1_000_000, medida_cada=100,
         crítica (ignorado si `ventana_critica` es None).
     verbose : bool
         Si True, imprime el progreso y una estimación del tiempo restante.
+    n_procesos : int o None
+        Número de procesos para ejecutar las simulaciones (N, T) EN PARALELO
+        (una tarea por punto de la rejilla). Cada simulación es independiente,
+        así que se reparten entre los cores con `ProcessPoolExecutor`. Si es
+        None se usa `os.cpu_count()`; si es 1 se ejecuta en serie (útil para
+        depurar). La semilla de cada punto depende solo de su índice fijo en
+        el orden (N, T), no del orden en que terminan los procesos, de modo
+        que el resultado es idéntico bit a bit al de la ejecución en serie.
 
     Devuelve
     --------
     pandas.DataFrame con una fila por combinación (N, T), incluyendo la
     columna `n_pmc` con los pasos Monte Carlo realmente usados en cada
-    fila (útil para verificar el refuerzo en la ventana crítica).
+    fila (útil para verificar el refuerzo en la ventana crítica). El orden
+    de las filas es el mismo (for N: for T:) que en serie.
     """
-    filas = []
-    total = len(N_values) * len(T_values)
-    contador = 0
+    # Se construye la lista de tareas en el MISMO orden (for N: for T:) que
+    # la versión en serie, y la semilla de cada punto se deriva de su índice
+    # fijo -> los resultados no dependen del planificador de procesos.
+    tareas = []
+    for idx, (N, T) in enumerate((N, T) for N in N_values for T in T_values):
+        if ventana_critica is not None and ventana_critica[0] <= T <= ventana_critica[1]:
+            n_pmc_T = int(round(n_pmc * factor_pmc_critico))
+        else:
+            n_pmc_T = n_pmc
+        semilla_run = None if semilla is None else int(semilla) + idx + 1
+        tareas.append((N, T, n_pmc_T, medida_cada, n_termalizacion,
+                       semilla_run, n_bootstrap, etiqueta))
+
+    total = len(tareas)
+    if n_procesos is None:
+        n_procesos = os.cpu_count() or 1
+    n_procesos = max(1, min(int(n_procesos), total))
     t_inicio = time.time()
 
-    for N in N_values:
-        for T in T_values:
-            contador += 1
-            t0 = time.time()
-
-            if ventana_critica is not None and ventana_critica[0] <= T <= ventana_critica[1]:
-                n_pmc_T = int(round(n_pmc * factor_pmc_critico))
-            else:
-                n_pmc_T = n_pmc
-
-            semilla_run = None if semilla is None else int(semilla) + contador
-            magnetizaciones, energias, _ = simular_ising(
-                N, T, n_pmc_T, medida_cada, n_termalizacion, semilla_run)
-
-            m_mean, m_err = estimar_errores(np.abs(magnetizaciones))
-
-            e_mean, e_err = estimar_errores(energias)
-            e_enunciado = e_mean / (2.0 * N)
-            e_enunciado_err = e_err / (2.0 * N)
-            e_por_spin = e_mean / (N ** 2)
-            e_por_spin_err = e_err / (N ** 2)
-
-            c_mean = _calor_especifico(energias, N, T)
-            c_err = bootstrap_bloques(
-                energias, lambda e: _calor_especifico(e, N, T),
-                n_bootstrap=n_bootstrap, semilla=semilla_run)
-
-            filas.append(dict(
-                N=N, T=T, malla=etiqueta, n_pmc=n_pmc_T,
-                m=m_mean, m_err=m_err,
-                e_enunciado=e_enunciado, e_enunciado_err=e_enunciado_err,
-                e_por_spin=e_por_spin, e_por_spin_err=e_por_spin_err,
-                c=c_mean, c_err=c_err,
-            ))
-
+    if n_procesos == 1:
+        # Ruta en serie (idéntica numéricamente; sin overhead de procesos).
+        filas = []
+        for k, tarea in enumerate(tareas, 1):
+            filas.append(_simular_punto(tarea))
             if verbose:
-                dt = time.time() - t0
-                transcurrido = time.time() - t_inicio
-                restante = transcurrido / contador * (total - contador)
-                print(f"[{contador:3d}/{total}] N={N:4d} T={T:.4f} n_pmc={n_pmc_T:8d}  "
-                      f"m={m_mean:.4f}+-{m_err:.4f}  "
-                      f"e_spin={e_por_spin:.4f}+-{e_por_spin_err:.4f}  "
-                      f"c={c_mean:.4f}+-{c_err:.4f}  "
-                      f"({dt:.1f}s, restante ~{restante/60:.1f} min)")
+                _log_progreso(k, total, filas[-1], t_inicio)
+        return pd.DataFrame(filas)
 
-    return pd.DataFrame(filas)
+    if verbose:
+        print(f"Ejecutando {total} simulaciones (N, T) en paralelo con "
+              f"{n_procesos} procesos...")
+
+    # Warm-up del JIT en el proceso padre: compila las funciones @njit y
+    # puebla el cache en disco (cache=True) para que los procesos hijos lo
+    # carguen en vez de recompilar todos a la vez la primera ejecución.
+    T_cal = float(np.mean(np.asarray(list(T_values), dtype=float)))
+    simular_ising(int(min(N_values)), T_cal, 1, 1, 0, semilla)
+
+    # Los resultados se recolocan por índice de tarea para que el orden de
+    # las filas sea idéntico al de la versión en serie.
+    filas_por_idx = [None] * total
+    with ProcessPoolExecutor(max_workers=n_procesos) as ejecutor:
+        futuros = {ejecutor.submit(_simular_punto, tarea): i
+                   for i, tarea in enumerate(tareas)}
+        for k, futuro in enumerate(as_completed(futuros), 1):
+            i = futuros[futuro]
+            filas_por_idx[i] = futuro.result()
+            if verbose:
+                _log_progreso(k, total, filas_por_idx[i], t_inicio)
+
+    return pd.DataFrame(filas_por_idx)
